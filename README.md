@@ -1,138 +1,90 @@
-<div align="center">
-  
-  <img src="https://github.com/DogeNetwork/dogeub/blob/main/public/logo.svg" width="322" />
-  <br />
+**Leopard Proxy (DogeUB v5) — Setup & Run Guide**
 
-  <hr />
-  DogeUB (Doge Unblocker) version 5 is finally here!
+This project is a modern web proxy hub with a React (Vite) frontend, a small Node/Fastify server, and an optional AI chat powered via a secure server-side proxy.
 
-  
-  <br />
-  <br />
+Note: Do not commit secrets. Keep your `.env` local or configure env vars in your host.
 
-  <img width="1278" height="628" alt="image" src="preview.png" />
+**Prerequisites**
+- Node.js 18+ (Node 20 LTS recommended)
+- Git
 
+**1) Get the Code**
+- Clone your fork or this repo
+  - `git clone <your-repo-url>`
+  - `cd <repo-folder>`
 
-</div>
+**2) Install Dependencies**
+- `npm install`
 
-## Overview
+**3) Configure Environment**
+- Create a `.env` file in the project root (server reads it via `dotenv`). Add any keys you plan to use:
+  - OpenAI: `OPENAI_API_KEY=<your key>`
+  - OpenRouter: `OPENROUTER_API_KEY=<your key>`
+  - Google Gemini: `GEMINI_API_KEY=<your key>`
+  - Groq: `GROQ_API_KEY=<your key>`
 
-DogeUB is a modern web proxy frontend and internet browsing hub, allowing you to browse the web anonymously while providing a full suite of apps and games, built with [React](https://github.com/facebook/react).
+Keys are only used in `server.js` and never shipped to the browser.
 
-> [!IMPORTANT]
-> Please consider starring our repository if you are forking it!
+- Full app (frontend + server):
+  1. Build the frontend once: `npm run build`
+  2. Start the server: `node server.js`
+  3. Open http://localhost:2345
+  4. For live UI edits while the server is running, you can rebuild in watch mode in a second terminal:
+     - `npx vite build --watch`
 
-### Features:
+Port note: the server listens on port 2345 (hardcoded in `server.js`). If that port is taken, stop the other process or change the code.
 
-- **Performance:** Fast, lightweight, and highly responsive.
-- **Tabs:** Browse multiple sites with ease, providing an experience similar to a web browser!
-- **Customization:** Multiple themes, extensive settings, and user-tailored experience.
+Advanced dev (optional): You can configure Vite to proxy backend routes to the Node server so you can use `npm run dev` for the UI while the server handles APIs. Add proxies for `/api`, `/wisp`, `/seal`, `/_uv`, `/uv`, `/_dist_uv`, `/baremux`, `/baremod`, `/epoxy` to `http://localhost:2345` in `vite.config.js`.
 
----
+**5) Production**
+- Build and run
+  - `npm ci` (or `npm install --omit=dev`)
+  - `npm run build`
+  - `node server.js`
+- Optional: use a process manager
+  - `npm i -g pm2`
+  - `pm2 start server.js --name proxy`
 
-## Development & Building
+**AI Configuration**
+- Centralized in `src/data/aiConfig.js` — set default provider, model categories, allowed models, and routing “chains” used by the server when a model is selected in the UI.
+- The UI model list is also defined there and re-exported by `src/data/models.js` for the dropdown.
+- The server exposes two endpoints consumed by the UI:
+  - `POST /api/ai` (final-only)
+  - `POST /api/ai_stream` (server‑sent events streaming)
+- Providers supported by the server (pick any you have keys for): OpenAI, OpenRouter, Gemini, Groq. Missing keys simply disable that provider.
 
+**Optional Web Search Tools**
+- If you enable web search in the UI, the server may call an external search API when configured. Supported keys:
+  - `SERPER_API_KEY` (preferred if present)
+  - `BING_SUBSCRIPTION_KEY` (uses `BING_ENDPOINT` if provided, defaults to `https://api.bing.microsoft.com`)
+  - `TAVILY_API_KEY`
 
-### Production:
-```bash
-git clone https://github.com/DogeNetwork/dogeub.git
-cd dogeub
-npm i
-npm run build
-node server.js
-````
+**MASQR (Optional Access Wall)**
+- Set `MASQR=true` to activate a simple access/license gate handled by `masqr.js`.
+- Defaults expect a license server at `http://localhost:8004/validate?license=` (see `LICENSE_SERVER_URL` inside `masqr.js`). You can customize whitelist behavior and responses there.
 
-### Development:
+**Deploying on Render (example)**
+- Connect the repo in Render → New Web Service
+- Environment: Node
+- Build Command: `npm ci && npm run build`
+- Start Command: `node server.js`
+- Add your environment variables in the Render dashboard
+- Note: the provided `render.yaml` uses `npm build`; change that to `npm run build` if you rely on it.
 
-```bash
-git clone https://github.com/DogeNetwork/dogeub.git
-cd dogeub
-npm i
-npm run dev
-```
+**Available NPM Scripts**
+- `dev`: runs the Vite dev server
+- `build`: builds to `dist/`
+- `preview`: Vite preview of the built site (does not include the Node proxy)
+- `lint`: ESLint
 
----
+**Tech Notes**
+- Frontend: Vite + React
+- Server: Fastify with static hosting of `dist/`, Wisp websocket endpoint (`/wisp/`), Ultraviolet assets (`/_dist_uv/`, `/uv/*`), bare server (`/seal/`), and the AI proxy endpoints.
+- Static assets in `public/` are copied to `dist/` on build.
 
-## AI Configuration
+**Troubleshooting**
+- “API not found” during `npm run dev`: run the Node server (Option B) or add Vite proxies for `/api`, `/wisp`, `/seal`, etc.
+- Port already in use on 2345: stop the conflicting process or change the port in `server.js`.
+- AI says a provider is not configured: ensure the related `*_API_KEY` is present in `.env` and restart the server.
 
-The Leopard AI chat uses a secure server-side proxy (`/api/ai`).
-
-- Edit provider models, endpoints, defaults, and tool behavior in one place:
-  - `src/data/aiConfig.js`
-- Add your API keys to a `.env` file in the project root (server-only — never exposed to users). Restart the server after changes.
-
-Example `.env`:
-
-```
-# Choose which provider the server uses by default: openai | openrouter | gemini | groq
-AI_PROVIDER=openai
-
-# OpenAI
-OPENAI_API_KEY=sk-xxx
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_ALLOWED_MODELS=gpt-4o-mini,gpt-4o,o4,o4-mini
-# Optional web-search mode overrides
-OPENAI_MODEL_WEB=o4
-OPENAI_ALLOWED_MODELS_WEB=gpt-4o-mini,gpt-4o,o4,o4-mini
-
-# OpenRouter (OpenAI-compatible endpoint)
-OPENROUTER_API_KEY=or-xxx
-OPENROUTER_MODEL=openai/gpt-4o-mini
-OPENROUTER_ALLOWED_MODELS=openai/gpt-4o-mini,anthropic/claude-3.5-sonnet
-# Optional web-search mode overrides (if web search is toggled, provider switches to WEBSEARCH_PROVIDER)
-WEBSEARCH_PROVIDER=gemini
-OPENROUTER_MODEL_WEB=openai/gpt-4o
-OPENROUTER_ALLOWED_MODELS_WEB=openai/gpt-4o-mini,openai/gpt-4o,anthropic/claude-3.5-sonnet
-# Optional, helps with OpenRouter dashboards/limits
-SITE_URL=https://your-domain.example
-SITE_TITLE=Leopard AI
-
-# Gemini (Google)
-GEMINI_API_KEY=ya29.xxx
-GEMINI_MODEL=gemini-1.5-flash
-GEMINI_ALLOWED_MODELS=gemini-1.5-flash,gemini-1.5-pro
-# Optional web-search mode overrides
-GEMINI_MODEL_WEB=gemini-1.5-pro
-GEMINI_ALLOWED_MODELS_WEB=gemini-1.5-flash,gemini-1.5-pro
-
-# Groq (OpenAI-compatible endpoint)
-GROQ_API_KEY=gsk_xxx
-GROQ_MODEL=llama-3.1-70b-versatile
-GROQ_ALLOWED_MODELS=llama-3.1-70b-versatile,llama-3.1-8b-instant,mixtral-8x7b-32768,gemma2-9b-it
-# Optional web-search mode overrides
-GROQ_MODEL_WEB=llama-3.1-70b-versatile
-GROQ_ALLOWED_MODELS_WEB=llama-3.1-70b-versatile,llama-3.1-8b-instant,mixtral-8x7b-32768,gemma2-9b-it
-```
-
-Notes:
-- Keys are only read by `server.js` via `dotenv` and never sent to the browser.
-- The UI model dropdown is defined in `src/data/models.js`. Edit that file to control the list and labels shown. When using OpenRouter, Gemini, or Groq, ensure your selected model id matches what that provider expects, or set a fallback model via `*_MODEL` and optionally `*_MODEL_WEB`.
-- You can also pass a `provider` in the request body if you want to override the default for a specific call (e.g., `{ provider: 'gemini' }`). If omitted, the server uses `AI_PROVIDER`.
- - When Web Search is toggled on in the UI, the server prefers the `*_MODEL_WEB` fallback for the active provider (if set). With OpenAI and no explicit web fallback, it gently steps up the model (Mini → o4‑mini → o4). If the active provider is `openrouter`, the server switches to `WEBSEARCH_PROVIDER` (default: gemini) for tool-enabled runs.
-
-
-## Contributors / Developers
-
-| Name          | Role               | GitHub |
-| ------------- | ------------------ | ------ |
-| Derpman | Lead Developer     |      [@stellarcase](https://github.com/stellarcase) |
-| Fowntain | Lead Developer | [@fowntain](https://github.com/fowntain)     |
-| Akane | Contributor | [@genericness](https://github.com/genericness)     |
-
-
-> [!NOTE]
-> Want to be on this list? Make a pull request!
-
----
-
-### Made possible thanks to:
-
-* [MercuryWorkshop/wisp-server-node](https://github.com/MercuryWorkshop/wisp-server-node)
-* [MercuryWorkshop/scramjet](https://github.com/MercuryWorkshop/scramjet)
-* [titaniumnetwork-dev/Ultraviolet](https://github.com/titaniumnetwork-dev/Ultraviolet)
-* [lucide-icons/lucide](https://github.com/lucide-icons/lucide)
-
-## License
-
-This project is licensed under the **Genuerro Afro V3 License**.  
-See the [LICENSE](LICENSE) file for more details.
+License: see `LICENSE`.
