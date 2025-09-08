@@ -1,0 +1,118 @@
+/* Scoped to AI page via .ai-scope to avoid affecting other pages */
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-scope * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* Easing */
+:root {
+  --ai-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Keyframes */
+@keyframes ai-fade-in {
+  from { opacity: 0 }
+  to   { opacity: 1 }
+}
+
+@keyframes ai-fade-up {
+  from { opacity: 0; transform: translateY(6px) scale(0.995) }
+  to   { opacity: 1; transform: translateY(0) scale(1) }
+}
+
+@keyframes ai-slide-in-left {
+  from { opacity: 0; transform: translateX(-8px) }
+  to   { opacity: 1; transform: translateX(0) }
+}
+
+@keyframes ai-scale-in {
+  from { opacity: 0; transform: scale(0.98) }
+  to   { opacity: 1; transform: scale(1) }
+}
+
+/* Page and panels */
+.ai-scope .ai-anim-page {
+  animation: ai-fade-in 220ms var(--ai-ease) both;
+}
+
+.ai-scope .ai-anim-panel {
+  animation: ai-fade-up 220ms var(--ai-ease) both;
+}
+
+.ai-scope .ai-slide-in-left {
+  animation: ai-slide-in-left 240ms var(--ai-ease) both;
+}
+
+/* Messages (staggered) */
+.ai-scope .ai-anim-message {
+  animation: ai-fade-up 240ms var(--ai-ease) both;
+  animation-delay: var(--delay, 0ms);
+  will-change: transform, opacity;
+}
+
+/* Attachments and chips */
+.ai-scope .ai-anim-attachment {
+  animation: ai-fade-up 180ms var(--ai-ease) both;
+}
+
+/* Modal */
+.ai-scope .ai-anim-backdrop {
+  animation: ai-fade-in 180ms ease-out both;
+}
+
+.ai-scope .ai-anim-modal {
+  animation: ai-scale-in 220ms var(--ai-ease) both;
+}
+
+/* Collapsible content helper (height auto with CSS grid technique) */
+.ai-scope .ai-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  overflow: hidden;
+  transition: grid-template-rows 200ms var(--ai-ease), opacity 180ms var(--ai-ease);
+  opacity: 0.85;
+}
+.ai-scope .ai-collapse.open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.ai-scope .ai-collapse > * { min-height: 0; }
+
+/* Subtle hover & active micro-interactions */
+.ai-scope button,
+.ai-scope a,
+.ai-scope .clickable {
+  transition: transform 150ms var(--ai-ease),
+              opacity 150ms linear,
+              box-shadow 180ms var(--ai-ease),
+              background-color 150ms linear,
+              border-color 150ms linear;
+}
+
+.ai-scope button:hover,
+.ai-scope a:hover,
+.ai-scope .clickable:hover {
+  transform: translateY(-1px);
+}
+
+.ai-scope button:active,
+.ai-scope a:active,
+.ai-scope .clickable:active {
+  transform: translateY(0) scale(0.995);
+}
+
+/* Inputs */
+.ai-scope textarea,
+.ai-scope input[type="text"],
+.ai-scope input[type="search"] {
+  transition: box-shadow 180ms var(--ai-ease), border-color 150ms linear, background-color 150ms linear, color 150ms linear;
+}
+
+.ai-scope textarea:focus,
+.ai-scope input[type="text"]:focus,
+.ai-scope input[type="search"]:focus {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--search-border) 40%, transparent);
+}

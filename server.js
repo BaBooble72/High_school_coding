@@ -1,0 +1,801 @@
+import dotenv from "dotenv";
+import { AI_CONFIG, UI_ID_TO_CATEGORY } from "./src/data/aiConfig.js";
+import Fastify from "fastify";
+import fastifyStatic from "@fastify/static";
+import fastifyCookie from "@fastify/cookie";
+import wisp from "wisp-server-node";
+import { join } from "node:path";
+import { access } from "node:fs/promises";
+import { createServer, ServerResponse } from "node:http";
+import { createBareServer } from "@tomphttp/bare-server-node";
+import { epoxyPath } from "@mercuryworkshop/epoxy-transport";
+import { baremuxPath } from "@mercuryworkshop/bare-mux/node";
+import { bareModulePath } from "@mercuryworkshop/bare-as-module3";
+import { uvPath } from "@titaniumnetwork-dev/ultraviolet";
+import { MasqrMiddleware } from "./masqr.js";
+
+dotenv.config();
+ServerResponse.prototype.setMaxListeners(50);
+
+const port = 2345, server = createServer(), bare = createBareServer("/seal/");
+server.on("upgrade", (req, sock, head) =>
+  bare.shouldRoute(req) ? bare.routeUpgrade(req, sock, head)
+  : req.url.endsWith("/wisp/") ? wisp.routeRequest(req, sock, head)
+  : sock.end()
+);
+const app = Fastify({
+  serverFactory: h => (server.on("request", (req,res) =>
+    bare.shouldRoute(req) ? bare.routeRequest(req,res) : h(req,res)), server),
+  logger: false
+});
+
+await app.register(fastifyCookie);
+[
+  { root: join(import.meta.dirname, "dist"), prefix: "/", decorateReply: true },
+  { root: epoxyPath, prefix: "/epoxy/" },
+  { root: baremuxPath, prefix: "/baremux/" },
+  { root: bareModulePath, prefix: "/baremod/" },
+  { root: join(import.meta.dirname, "dist/uv"), prefix: "/_dist_uv/" },
+  { root: uvPath, prefix: "/_uv/" }
+].forEach(r => app.register(fastifyStatic, { ...r, decorateReply: r.decorateReply||false }));
+
+app.get("/uv/*", async (req, reply) =>
+  reply.sendFile(req.params["*"], await access(join(import.meta.dirname,"dist/uv",req.params["*"]))
+    .then(()=>join(import.meta.dirname,"dist/uv")).catch(()=>uvPath))
+);
+
+if (process.env.MASQR === "true")
+  app.addHook("onRequest", MasqrMiddleware);
+
+// Simple per-day model usage limits (in-memory, resets every UTC day)
+const MODEL_LIMITS = {
+  gemini: {
+    'gemini-2.5-flash-lite': 1000,
+    'gemini-2.0-flash-lite': 200,
+    'gemini-2.5-flash': 250,
+    'gemini-2.0-flash': 200,
+    'gemini-2.5-pro': 100,
+  },
+  groq: {
+    'openai/gpt-oss-120b': 1000,
+    'openai/gpt-oss-20b': 1000,
+    'groq/compound': 250,
+    'groq/compound-mini': 250,
+  },
+  openrouterTotal: 1000,
+};
+
+const USAGE = { date: '', perModel: Object.create(null), openrouter: 0 };
+const dateKey = () => new Date().toISOString().slice(0, 10); // UTC day
+function ensureUsageDay() {
+  const dk = dateKey();
+  if (USAGE.date !== dk) {
+    USAGE.date = dk;
+    USAGE.perModel = Object.create(null);
+    USAGE.openrouter = 0;
+  }
+}
+function tryConsume(provider, model) {
+  ensureUsageDay();
+  if (provider === 'openrouter') {
+    if (USAGE.openrouter >= MODEL_LIMITS.openrouterTotal) return false;
+    USAGE.openrouter++;
+    return true;
+  }
+  if (provider === 'gemini' || provider === 'groq') {
+    const limits = MODEL_LIMITS[provider] || {};
+    const limit = limits[model];
+    if (!limit) return true; // unlisted: unlimited
+    const key = provider + ':' + model;
+    const used = USAGE.perModel[key] || 0;
+    if (used >= limit) return false;
+    USAGE.perModel[key] = used + 1;
+    return true;
+  }
+  // other providers: no limits
+  return true;
+}
+
+const proxy = (url, type="application/javascript") => async (req, reply) => {
+  try {
+    // Helper tools for providers using OpenAI-style function calling
+    const TEXT_LIMIT = 5000;
+    const trim = (s, n = TEXT_LIMIT) => (s && s.length > n ? s.slice(0, n) + "\n...[truncated]" : s || '');
+    const searchWeb = async (query, topK = 5) => {
+      try {
+        // Try Serper first (Google SERP JSON) if configured
+        if (process.env.SERPER_API_KEY) {
+          const res = await fetch('https://google.serper.dev/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-KEY': process.env.SERPER_API_KEY },
+            body: JSON.stringify({ q: query, num: Math.max(1, Math.min(10, topK)) }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            const items = (data?.organic || []).slice(0, topK).map((r) => ({
+              title: r?.title, url: r?.link, snippet: r?.snippet,
+            })).filter((x) => x.url);
+            return items;
+          }
+        }
+        // Try Bing if configured
+        if (process.env.BING_SUBSCRIPTION_KEY) {
+          const endpoint = (process.env.BING_ENDPOINT || 'https://api.bing.microsoft.com').replace(/\/$/, '') + '/v7.0/search?q=' + encodeURIComponent(query);
+          const res = await fetch(endpoint, { headers: { 'Ocp-Apim-Subscription-Key': process.env.BING_SUBSCRIPTION_KEY } });
+          if (res.ok) {
+            const data = await res.json();
+            const items = (data?.webPages?.value || []).slice(0, topK).map((r) => ({
+              title: r?.name, url: r?.url, snippet: r?.snippet,
+            })).filter((x) => x.url);
+            return items;
+          }
+        }
+        // Try Tavily if configured
+        if (process.env.TAVILY_API_KEY) {
+          const res = await fetch('https://api.tavily.com/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_key: process.env.TAVILY_API_KEY, query, max_results: Math.max(1, Math.min(10, topK)) }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            const items = (data?.results || []).slice(0, topK).map((r) => ({
+              title: r?.title, url: r?.url, snippet: r?.content || r?.snippet,
+            })).filter((x) => x.url);
+            return items;
+          }
+        }
+      } catch { /* ignore */ }
+      return [];
+    };
+
+    const fetchUrl = async (url) => {
+      try {
+        const res = await fetch(url, { redirect: 'follow' });
+        const ct = res.headers.get('content-type') || '';
+        if (!res.ok) return `Fetch failed (${res.status}) for ${url}`;
+        if (ct.includes('application/json')) {
+          const json = await res.json();
+          return trim(JSON.stringify(json, null, 2));
+        }
+        const text = await res.text();
+        // crude tag strip
+        const cleaned = text.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        return trim(cleaned);
+      } catch (e) {
+        return `Fetch error for ${url}: ${(e && e.message) || 'unknown error'}`;
+      }
+    };
+
+    const res = await fetch(url(req)); if (!res.ok) return reply.code(res.status).send();
+    if (res.headers.get("content-type")) reply.type(res.headers.get("content-type")); else reply.type(type);
+    return reply.send(Buffer.from(await res.arrayBuffer()));
+  } catch { return reply.code(500).send(); }
+};
+
+app.get("/assets/img/*", proxy(req => `https://dogeub-assets.pages.dev/img/${req.params["*"]}`, ""));
+app.get("/js/script.js", proxy(()=> "https://byod.privatedns.org/js/script.js"));
+
+// Simple AI proxy endpoint. If OPENAI_API_KEY is set, forward the chat
+// request to OpenAI's Chat Completions API. Otherwise, return a friendly
+// mock response so the UI still works without secrets.
+app.post("/api/ai", async (req, reply) => {
+  try {
+    const msgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const requestedModel = typeof req.body?.model === 'string' ? req.body.model : '';
+    const category = UI_ID_TO_CATEGORY[requestedModel] || 'instant';
+    const requestedTemperature = typeof req.body?.temperature === 'number' ? req.body.temperature : undefined;
+    let provider = (req.body?.provider || AI_CONFIG.defaultProvider || 'openai').toString().toLowerCase();
+    const useWeb = !!req.body?.webSearch;
+    const profile = (req.body?.profile || '').toString();
+    let sysText = "You are Leopard AI: concise, helpful, and friendly.";
+    if (profile === 'stem') sysText += " Specialize in STEM tasks: show reasoning steps, include formulas when relevant, keep units consistent, and provide short final answers after the work.";
+    if (profile === 'language') sysText += " Specialize in language tasks: grammar, translation, and language learning. Prefer the target language when appropriate and provide clear examples.";
+    if (useWeb) sysText += " When helpful and relevant, consider current information from the web and prioritize up-to-date facts. If you refer to external information, briefly cite the source or site name inline.";
+    // Choose primary provider/model by chain
+    const chain = (AI_CONFIG.chains?.[category] || {})[useWeb ? 'web' : 'regular'] || [];
+    const startIndex = Number.isInteger(req.body?.chainIndex) ? Math.max(0, req.body.chainIndex|0) : 0;
+    const chainSlice = chain.slice(startIndex);
+    let step = chainSlice.find((s) => s) || null;
+    // If step is openrouter but web mode is ON, skip to next tool-capable provider
+    if (useWeb && step && step.provider === 'openrouter') {
+      step = chainSlice.find((s) => s.provider !== 'openrouter') || step;
+    }
+    if (step) {
+      provider = step.provider || provider;
+    } else if (useWeb && provider === 'openrouter') {
+      // fallback: switch to a provider that supports tools
+      provider = (process.env.WEBSEARCH_PROVIDER || AI_CONFIG.webSearchProvider || 'gemini').toLowerCase();
+    }
+
+    const sys = { role: "system", content: sysText };
+
+    const desiredReasoning = (step && step.reasoning) || null; // low|medium|high
+    const tempHint = desiredReasoning === 'low' ? 0.2 : desiredReasoning === 'medium' ? 0.7 : desiredReasoning === 'high' ? 1.1 : undefined;
+    const temperature = Number.isFinite(requestedTemperature) ? Math.max(0, Math.min(2, requestedTemperature)) : (typeof tempHint === 'number' ? tempHint : 0.7);
+
+    // Helper to extract last user text for mock replies
+    const lastTextFromMsgs = () => {
+      const lastContent = msgs.at(-1)?.content;
+      return typeof lastContent === 'string'
+        ? lastContent
+        : Array.isArray(lastContent)
+          ? lastContent.map((p) => (typeof p?.text === 'string' ? p.text : '')).join(' ').trim()
+          : '';
+    };
+
+    if (provider === 'openrouter') {
+      const cfg = AI_CONFIG.providers.openrouter || {};
+      const apiKey = process.env.OPENROUTER_API_KEY;
+      if (!apiKey) {
+        const now = new Date().toLocaleString();
+        const mock = `OpenRouter key not set. Mocking.\n\nYou said: "${lastTextFromMsgs()}"\nTime: ${now}`;
+        return reply.send({ reply: mock });
+      }
+      const catCfg = (cfg.models?.categories || {})[category || 'instant'] || (cfg.models?.categories || {}).instant || {};
+      const allowed = (catCfg.allowed || []).map(s=>typeof s==='string'?s.trim():s).filter(Boolean);
+      const fallback = (step?.model) || catCfg.default || (cfg.models?.categories?.instant?.default) || "openai/gpt-4o-mini";
+      const model = (requestedModel && (allowed.length===0 || allowed.includes(requestedModel)) ? requestedModel : fallback);
+      if (!tryConsume('gemini', model)) return reply.code(429).send({ error: 'model_limit' });
+      if (!tryConsume('openrouter', 'any')) return reply.code(429).send({ error: 'model_limit' });
+      const endpoint = cfg.endpoints?.chat || "https://openrouter.ai/api/v1/chat/completions";
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model, messages: [sys, ...msgs], temperature }),
+      });
+      if (!res.ok) return reply.code(res.status).send();
+      const data = await res.json();
+      const text = data?.choices?.[0]?.message?.content || "(no response)";
+      return reply.send({ reply: text });
+    }
+
+    if (provider === 'gemini') {
+      const cfg = AI_CONFIG.providers.gemini || {};
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        const now = new Date().toLocaleString();
+        const mock = `Gemini key not set. Mocking.\n\nYou said: "${lastTextFromMsgs()}"\nTime: ${now}`;
+        return reply.send({ reply: mock });
+      }
+      const catCfg = (cfg.models?.categories || {})[category || 'instant'] || (cfg.models?.categories || {}).instant || {};
+      const allowed = (catCfg.allowed || []).map(s=>typeof s==='string'?s.trim():s).filter(Boolean);
+      const fallback = (step?.model) || catCfg.default || (cfg.models?.categories?.instant?.default) || "gemini-1.5-flash";
+      const model = (requestedModel && (allowed.length===0 || allowed.includes(requestedModel)) ? requestedModel : fallback);
+      if (!tryConsume('gemini', model)) return reply.code(429).send({ error: 'model_limit' });
+
+      // Convert OpenAI-style messages to Gemini contents
+      const toGeminiParts = (content) => {
+        if (typeof content === 'string') return [{ text: content }];
+        if (Array.isArray(content)) {
+          const parts = [];
+          for (const p of content) {
+            if (p?.type === 'text' && typeof p.text === 'string') parts.push({ text: p.text });
+            else if (p?.type === 'image_url' && p.image_url?.url) {
+              const url = p.image_url.url;
+              if (url.startsWith('data:')) {
+                try {
+                  const commaIdx = url.indexOf(',');
+                  const meta = url.slice(5, commaIdx); // e.g. image/png;base64
+                  const [mime] = meta.split(';');
+                  const b64 = url.slice(commaIdx + 1);
+                  parts.push({ inline_data: { mime_type: mime, data: b64 } });
+                } catch { /* ignore */ }
+              } else {
+                // Remote URL not supported inline; include as text reference
+                parts.push({ text: `[image] ${url}` });
+              }
+            }
+          }
+          return parts.length ? parts : [{ text: '' }];
+        }
+        return [{ text: '' }];
+      };
+
+      const contents = msgs.map((m) => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: toGeminiParts(m.content),
+      }));
+
+      const base = cfg.endpoints?.base || 'https://generativelanguage.googleapis.com/v1beta';
+      const endpoint = `${base}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const modelTools = (cfg.modelTools && cfg.modelTools[model]) || null;
+      const desiredFromModel = modelTools ? (useWeb ? modelTools.web : modelTools.regular) : null;
+      const desired = (step && step.tools) || desiredFromModel || { google_search: true, code_execution: true, url_context: true };
+      const toolsArr = [];
+      if (desired?.google_search) toolsArr.push({ google_search: {} });
+      if (desired?.code_execution) toolsArr.push({ code_execution: {} });
+      if (desired?.url_context) toolsArr.push({ url_context: {} });
+      const body = {
+        contents,
+        system_instruction: { role: 'system', parts: [{ text: sys.content }] },
+        generationConfig: { temperature },
+        tools: toolsArr,
+      };
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) return reply.code(res.status).send();
+      const data = await res.json();
+      const parts = data?.candidates?.[0]?.content?.parts || [];
+      const text = parts.map((p) => p?.text || '').join('\n').trim() || '(no response)';
+      return reply.send({ reply: text });
+    }
+
+    if (provider === 'groq') {
+      const cfg = AI_CONFIG.providers.groq || {};
+      const apiKey = process.env.GROQ_API_KEY;
+      if (!apiKey) {
+        const now = new Date().toLocaleString();
+        const mock = `Groq key not set. Mocking.\n\nYou said: "${lastTextFromMsgs()}"\nTime: ${now}`;
+        return reply.send({ reply: mock });
+      }
+      const catCfg = (cfg.models?.categories || {})[category || 'instant'] || (cfg.models?.categories || {}).instant || {};
+      const allowed = (catCfg.allowed || []).map(s=>typeof s==='string'?s.trim():s).filter(Boolean);
+      const fallback = (step?.model) || catCfg.default || (cfg.models?.categories?.instant?.default) || "llama-3.1-70b-versatile";
+      const model = (requestedModel && (allowed.length===0 || allowed.includes(requestedModel)) ? requestedModel : fallback);
+      if (!tryConsume('groq', model)) return reply.code(429).send({ error: 'model_limit' });
+
+      // Groq uses an OpenAI-compatible chat completions endpoint but models
+      // generally accept only text content. Normalize any structured parts.
+      const normalize = (content) => {
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) {
+          return content.map((p) => {
+            if (p?.type === 'text' && typeof p.text === 'string') return p.text;
+            if (p?.type === 'image_url' && p.image_url?.url) return `[image] ${p.image_url.url}`;
+            return '';
+          }).join(' ').trim();
+        }
+        return '';
+      };
+      let history = [sys, ...msgs.map((m) => ({ role: m.role, content: normalize(m.content) }))];
+      const sources = [];
+
+      const endpoint = cfg.endpoints?.chat || "https://api.groq.com/openai/v1/chat/completions";
+      const headers = { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" };
+      const mt = (cfg.modelTools && cfg.modelTools[model]) || null;
+      const mtDesired = (step && step.tools) || (mt ? (useWeb ? mt.web : mt.regular) : null);
+      const enableTools = cfg.tools?.supportsTools && ((cfg.tools?.alwaysEnable) || (mtDesired && (mtDesired.web_search || mtDesired.fetch_url || mtDesired.browser_search || mtDesired.visit_website)) || useWeb);
+      const groqTools = [];
+      if (enableTools && (mtDesired?.web_search || mtDesired?.browser_search || (cfg.tools?.webSearchTool && (useWeb || cfg.tools?.alwaysEnable)))) {
+        groqTools.push({
+          type: 'function',
+          function: {
+            name: 'web_search',
+            description: 'Search the web for up-to-date information and return top results.',
+            parameters: {
+              type: 'object',
+              properties: {
+                query: { type: 'string' },
+                top_k: { type: 'integer', minimum: 1, maximum: 10 },
+              },
+              required: ['query'],
+            },
+          },
+        });
+      }
+      if (enableTools && (mtDesired?.fetch_url || mtDesired?.visit_website || (cfg.tools?.fetchUrlTool && (useWeb || cfg.tools?.alwaysEnable)))) {
+        groqTools.push({
+          type: 'function',
+          function: {
+            name: 'fetch_url',
+            description: 'Fetch a URL and return a plain text summary of the content.',
+            parameters: {
+              type: 'object',
+              properties: { url: { type: 'string', format: 'uri' } },
+              required: ['url'],
+            },
+          },
+        });
+      }
+      const tools = enableTools && groqTools.length ? groqTools : undefined;
+
+      const callModel = async () => {
+        const payload = { model, messages: history, temperature, ...(tools ? { tools, tool_choice: 'auto' } : {}) };
+        const res = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(payload) });
+        if (!res.ok) return reply.code(res.status).send();
+        return res.json();
+      };
+
+      const runToolsOnce = async (msg) => {
+        const calls = msg?.tool_calls || [];
+        if (!calls.length) return false;
+        for (const tc of calls) {
+          try {
+            const name = tc.function?.name;
+            const args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {};
+            let result = '';
+            if (name === 'web_search' || name === 'browser_search') {
+              const items = await searchWeb(String(args.query||'').slice(0, 500), Math.max(1, Math.min(10, args.top_k || 5)));
+              try { sources.push(...items.map((r) => r.url).filter(Boolean)); } catch {}
+              result = items.length ? items.map((r, i) => `${i+1}. ${r.title}\n${r.url}\n${r.snippet||''}`).join('\n\n') : 'No results or search not configured.';
+            } else if (name === 'fetch_url' || name === 'visit_website') {
+              const u = String(args.url||'').slice(0, 1000);
+              if (u) try { sources.push(u); } catch {}
+              result = await fetchUrl(u);
+            } else if (name === 'code_interpreter') {
+              result = 'Code interpreter is not enabled on this server.';
+            } else if (name === 'browser_automation') {
+              result = 'Browser automation is not supported in this environment.';
+            } else {
+              result = `Unknown tool: ${name}`;
+            }
+            history.push({ role: 'tool', tool_call_id: tc.id, content: result });
+          } catch (e) {
+            history.push({ role: 'tool', tool_call_id: tc.id, content: `Tool execution error: ${(e && e.message) || 'unknown'}` });
+          }
+        }
+        return true;
+      };
+
+      // First call
+      let data = await callModel();
+      let message = data?.choices?.[0]?.message;
+      if (message?.tool_calls?.length) {
+        history.push({ role: 'assistant', content: message.content || '', tool_calls: message.tool_calls });
+        await runToolsOnce(message);
+        // Second call with tool outputs
+        data = await callModel();
+        message = data?.choices?.[0]?.message;
+      }
+      const text = message?.content || "(no response)";
+      // Deduplicate and limit to a handful
+      const uniq = Array.from(new Set(sources.filter(Boolean)));
+      return reply.send({ reply: text, sources: uniq.slice(0, 8) });
+    }
+
+    // Default: OpenAI
+    {
+      const cfg = AI_CONFIG.providers.openai || {};
+      const apiKey = process.env.OPENAI_API_KEY || process.env.OPENAI_API_TOKEN;
+      if (!apiKey) {
+        const now = new Date().toLocaleString();
+        const mock = `OpenAI key not set. Mocking.\n\nYou said: "${lastTextFromMsgs()}"\nTime: ${now}`;
+        return reply.send({ reply: mock });
+      }
+      const catCfg = (cfg.models?.categories || {})[category || 'instant'] || (cfg.models?.categories || {}).instant || {};
+      const allowed = (catCfg.allowed || []).map(s=>typeof s==='string'?s.trim():s).filter(Boolean);
+      const fallback = (step?.model) || catCfg.default || (cfg.models?.categories?.instant?.default) || "gpt-4o-mini";
+      const requested = requestedModel;
+      const model = (requested && (allowed.length===0 || allowed.includes(requested)) ? requested : fallback);
+      const endpoint = cfg.endpoints?.chat || "https://api.openai.com/v1/chat/completions";
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model, messages: [sys, ...msgs], temperature }),
+      });
+      if (!res.ok) return reply.code(res.status).send();
+      const data = await res.json();
+      const text = data?.choices?.[0]?.message?.content || "(no response)";
+      return reply.send({ reply: text });
+    }
+  } catch (e) {
+    return reply.code(500).send({ error: "ai_failed" });
+  }
+});
+
+// Simple image generation endpoint. Uses OpenAI Images if configured,
+// otherwise returns a placeholder image.
+app.post("/api/image", async (req, reply) => {
+  try {
+    const apiKey = process.env.OPENAI_API_KEY || process.env.OPENAI_API_TOKEN;
+    const prompt = (req.body?.prompt || '').toString().slice(0, 2000);
+    const model = (req.body?.model || 'gpt-image-1').toString();
+
+    if (!prompt) return reply.code(400).send({ error: 'missing_prompt' });
+
+    if (!apiKey) {
+      const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='512' height='512'><rect width='512' height='512' fill='black'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='white' font-size='20'>Image gen not configured</text></svg>`;
+      const dataUrl = `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+      return reply.send({ image: dataUrl });
+    }
+
+    const res = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model, prompt, size: '1024x1024' }),
+    });
+    if (!res.ok) return reply.code(res.status).send();
+    const data = await res.json();
+    const b64 = data?.data?.[0]?.b64_json;
+    if (!b64) return reply.code(500).send({ error: 'no_image' });
+    const dataUrl = `data:image/png;base64,${b64}`;
+    return reply.send({ image: dataUrl });
+  } catch (e) {
+    return reply.code(500).send({ error: 'image_failed' });
+  }
+});
+
+app.get("/return", async (req, reply) =>
+  req.query?.q
+    ? fetch(`https://duckduckgo.com/ac/?q=${encodeURIComponent(req.query.q)}`)
+        .then(r => r.json()).catch(()=>reply.code(500).send({error:"request failed"}))
+    : reply.code(401).send({ error: "query parameter?" })
+);
+
+// Streaming AI endpoint (SSE). Streams partial tokens as they arrive when
+// the selected provider supports OpenAI-compatible streaming.
+app.post("/api/ai_stream", async (req, reply) => {
+  try {
+    const msgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const requestedModel = typeof req.body?.model === 'string' ? req.body.model : '';
+    const category = UI_ID_TO_CATEGORY[requestedModel] || 'instant';
+    const requestedTemperature = typeof req.body?.temperature === 'number' ? req.body.temperature : undefined;
+    let provider = (req.body?.provider || AI_CONFIG.defaultProvider || 'openai').toString().toLowerCase();
+    const useWeb = !!req.body?.webSearch;
+    const profile = (req.body?.profile || '').toString();
+    let sysText = "You are Leopard AI: concise, helpful, and friendly.";
+    if (profile === 'stem') sysText += " Specialize in STEM tasks: show reasoning steps, include formulas when relevant, keep units consistent, and provide short final answers after the work.";
+    if (profile === 'language') sysText += " Specialize in language tasks: grammar, translation, and language learning. Prefer the target language when appropriate and provide clear examples.";
+    if (useWeb) sysText += " When helpful and relevant, consider current information from the web and prioritize up-to-date facts. If you refer to external information, briefly cite the source or site name inline.";
+    const sys = { role: "system", content: sysText };
+
+    // Choose chain step similar to /api/ai
+    const chain = (AI_CONFIG.chains?.[category] || {})[useWeb ? 'web' : 'regular'] || [];
+    const startIndex = Number.isInteger(req.body?.chainIndex) ? Math.max(0, req.body.chainIndex|0) : 0;
+    const chainSlice = chain.slice(startIndex);
+    let step = chainSlice.find((s) => s) || null;
+    if (useWeb && step && step.provider === 'openrouter') {
+      step = chainSlice.find((s) => s.provider !== 'openrouter') || step;
+    }
+    if (step) provider = step.provider || provider;
+    else if (useWeb && provider === 'openrouter') provider = (process.env.WEBSEARCH_PROVIDER || AI_CONFIG.webSearchProvider || 'gemini').toLowerCase();
+
+    const desiredReasoning = (step && step.reasoning) || null; // low|medium|high
+    const tempHint = desiredReasoning === 'low' ? 0.2 : desiredReasoning === 'medium' ? 0.7 : desiredReasoning === 'high' ? 1.1 : undefined;
+    const temperature = Number.isFinite(requestedTemperature) ? Math.max(0, Math.min(2, requestedTemperature)) : (typeof tempHint === 'number' ? tempHint : 0.7);
+
+    // Streaming for Gemini via SSE (v1beta streamGenerateContent)
+    if (provider === 'gemini') {
+      const cfg = AI_CONFIG.providers.gemini || {};
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) return reply.code(204).send();
+      const catCfg = (cfg.models?.categories || {})[category || 'instant'] || (cfg.models?.categories || {}).instant || {};
+      const allowed = (catCfg.allowed || []).map(s=>typeof s==='string'?s.trim():s).filter(Boolean);
+      const fallback = (step?.model) || catCfg.default || (cfg.models?.categories?.instant?.default) || "gemini-2.5-flash";
+      const model = (requestedModel && (allowed.length===0 || allowed.includes(requestedModel)) ? requestedModel : fallback);
+
+      const toGeminiParts = (content) => {
+        if (typeof content === 'string') return [{ text: content }];
+        if (Array.isArray(content)) {
+          const parts = [];
+          for (const p of content) {
+            if (p?.type === 'text' && typeof p.text === 'string') parts.push({ text: p.text });
+            else if (p?.type === 'image_url' && p.image_url?.url) {
+              const url = p.image_url.url;
+              if (url.startsWith('data:')) {
+                try {
+                  const commaIdx = url.indexOf(',');
+                  const meta = url.slice(5, commaIdx);
+                  const [mime] = meta.split(';');
+                  const b64 = url.slice(commaIdx + 1);
+                  parts.push({ inline_data: { mime_type: mime, data: b64 } });
+                } catch {}
+              } else {
+                parts.push({ text: `[image] ${url}` });
+              }
+            }
+          }
+          return parts.length ? parts : [{ text: '' }];
+        }
+        return [{ text: '' }];
+      };
+
+      const contents = msgs.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: toGeminiParts(m.content) }));
+      const base = cfg.endpoints?.base || 'https://generativelanguage.googleapis.com/v1beta';
+      const endpoint = `${base}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+      const modelTools = (cfg.modelTools && cfg.modelTools[model]) || null;
+      const desiredFromModel = modelTools ? (useWeb ? modelTools.web : modelTools.regular) : null;
+      const desired = (step && step.tools) || desiredFromModel || { google_search: true, code_execution: true, url_context: true };
+      const toolsArr = [];
+      if (desired?.google_search) toolsArr.push({ google_search: {} });
+      if (desired?.code_execution) toolsArr.push({ code_execution: {} });
+      if (desired?.url_context) toolsArr.push({ url_context: {} });
+      const body = { contents, system_instruction: { role: 'system', parts: [{ text: sys.content }] }, generationConfig: { temperature }, tools: toolsArr };
+
+      // Prepare SSE headers
+      reply.raw.setHeader('Content-Type', 'text/event-stream');
+      reply.raw.setHeader('Cache-Control', 'no-cache');
+      reply.raw.setHeader('Connection', 'keep-alive');
+      reply.raw.flushHeaders?.();
+      const send = (obj) => reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`);
+
+      const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (!res.ok || !res.body) { send({ done: true }); return reply.raw.end(); }
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for await (const chunk of res.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          if (payload === '[DONE]') { send({ done: true }); return reply.raw.end(); }
+          try {
+            const json = JSON.parse(payload);
+            const cand = (json && json.candidates && json.candidates[0]) || {};
+            const contentParts = (cand.content && cand.content.parts) || [];
+            const thinkingParts = (cand.thinking && cand.thinking.parts) || (cand.thought && cand.thought.parts) || [];
+            const cText = contentParts.map((p) => (typeof p?.text === 'string' ? p.text : '')).join('');
+            if (cText) send({ type: 'content', delta: cText });
+            const tText = thinkingParts.map((p) => (typeof p?.text === 'string' ? p.text : '')).join('');
+            if (tText) send({ type: 'thinking', delta: tText });
+          } catch {}
+        }
+      }
+      send({ done: true });
+      return reply.raw.end();
+    }
+
+    // If OpenRouter pool is at limit, skip streaming early so client falls back
+    if (provider === 'openrouter' && !tryConsume('openrouter', 'any')) {
+      return reply.code(429).send({ error: 'model_limit' });
+    }
+    // Prepare SSE headers only when streaming
+    reply.raw.setHeader('Content-Type', 'text/event-stream');
+    reply.raw.setHeader('Cache-Control', 'no-cache');
+    reply.raw.setHeader('Connection', 'keep-alive');
+    reply.raw.flushHeaders?.();
+
+    const send = (obj) => reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`);
+
+    // Provider: OpenRouter (OpenAI-compatible) STREAM
+    if (provider === 'openrouter') {
+      const cfg = AI_CONFIG.providers.openrouter || {};
+      const apiKey = process.env.OPENROUTER_API_KEY;
+      if (!apiKey) { send({ delta: "[OpenRouter not configured]" }); send({ done: true }); return reply.raw.end(); }
+      const catCfg = (cfg.models?.categories || {})[category || 'instant'] || (cfg.models?.categories || {}).instant || {};
+      const allowed = (catCfg.allowed || []).map(s=>typeof s==='string'?s.trim():s).filter(Boolean);
+      const fallback = (step?.model) || catCfg.default || (cfg.models?.categories?.instant?.default) || "openai/gpt-4o-mini";
+      const model = (requestedModel && (allowed.length===0 || allowed.includes(requestedModel)) ? requestedModel : fallback);
+      const endpoint = cfg.endpoints?.chat || "https://openrouter.ai/api/v1/chat/completions";
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model, messages: [sys, ...msgs], temperature, stream: true }),
+      });
+      if (!res.ok || !res.body) { send({ delta: "" }); send({ done: true }); return reply.raw.end(); }
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for await (const chunk of res.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          if (payload === '[DONE]') { send({ done: true }); return reply.raw.end(); }
+          try {
+            const json = JSON.parse(payload);
+            const d = json?.choices?.[0]?.delta || {};
+            if (typeof d.reasoning === 'string' && d.reasoning) send({ type: 'thinking', delta: d.reasoning });
+            if (typeof d.content === 'string' && d.content) send({ type: 'content', delta: d.content });
+          } catch {}
+        }
+      }
+      send({ done: true });
+      return reply.raw.end();
+    }
+
+    // Provider: Groq (OpenAI-compatible) STREAM
+    if (provider === 'groq') {
+      const cfg = AI_CONFIG.providers.groq || {};
+      const apiKey = process.env.GROQ_API_KEY;
+      // Model will be decided later; preflight will happen after computing it in /api
+      // For streaming path, consume after we compute the model
+      if (!apiKey) { send({ delta: "[Groq not configured]" }); send({ done: true }); return reply.raw.end(); }
+      const catCfg = (cfg.models?.categories || {})[category || 'instant'] || (cfg.models?.categories || {}).instant || {};
+      const allowed = (catCfg.allowed || []).map(s=>typeof s==='string'?s.trim():s).filter(Boolean);
+      const fallback = (step?.model) || catCfg.default || (cfg.models?.categories?.instant?.default) || "groq/compound-mini";
+      const model = (requestedModel && (allowed.length===0 || allowed.includes(requestedModel)) ? requestedModel : fallback);
+      if (!tryConsume('groq', model)) { send({ delta: '' }); send({ done: true }); return reply.raw.end(); }
+      const endpoint = cfg.endpoints?.chat || "https://api.groq.com/openai/v1/chat/completions";
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model, messages: [sys, ...msgs], temperature, stream: true }),
+      });
+      if (!res.ok || !res.body) { send({ delta: "" }); send({ done: true }); return reply.raw.end(); }
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for await (const chunk of res.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          if (payload === '[DONE]') { send({ done: true }); return reply.raw.end(); }
+          try {
+            const json = JSON.parse(payload);
+            const d = json?.choices?.[0]?.delta || {};
+            if (typeof d.reasoning === 'string' && d.reasoning) send({ type: 'thinking', delta: d.reasoning });
+            if (typeof d.content === 'string' && d.content) send({ type: 'content', delta: d.content });
+          } catch {}
+        }
+      }
+      send({ done: true });
+      return reply.raw.end();
+    }
+
+    // Default: OpenAI STREAM (or final-only if key missing)
+    {
+      const cfg = AI_CONFIG.providers.openai || {};
+      const apiKey = process.env.OPENAI_API_KEY || process.env.OPENAI_API_TOKEN;
+      if (!apiKey) { send({ delta: "[OpenAI not configured]" }); send({ done: true }); return reply.raw.end(); }
+      const catCfg = (cfg.models?.categories || {})[category || 'instant'] || (cfg.models?.categories || {}).instant || {};
+      const allowed = (catCfg.allowed || []).map(s=>typeof s==='string'?s.trim():s).filter(Boolean);
+      const fallback = (step?.model) || catCfg.default || (cfg.models?.categories?.instant?.default) || "gpt-4o-mini";
+      const model = (requestedModel && (allowed.length===0 || allowed.includes(requestedModel)) ? requestedModel : fallback);
+      if (!tryConsume('openrouter', 'any')) { send({ delta: '' }); send({ done: true }); return reply.raw.end(); }
+      const endpoint = cfg.endpoints?.chat || "https://api.openai.com/v1/chat/completions";
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model, messages: [sys, ...msgs], temperature, stream: true }),
+      });
+      if (!res.ok || !res.body) { send({ delta: "" }); send({ done: true }); return reply.raw.end(); }
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for await (const chunk of res.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          if (payload === '[DONE]') { send({ done: true }); return reply.raw.end(); }
+          try {
+            const json = JSON.parse(payload);
+            const d = json?.choices?.[0]?.delta || {};
+            if (typeof d.reasoning === 'string' && d.reasoning) send({ type: 'thinking', delta: d.reasoning });
+            if (typeof d.content === 'string' && d.content) send({ type: 'content', delta: d.content });
+          } catch {}
+        }
+      }
+      send({ done: true });
+      return reply.raw.end();
+    }
+  } catch (e) {
+    try { reply.raw.write(`data: ${JSON.stringify({ error: 'stream_failed' })}\n\n`); } catch {}
+    try { reply.raw.end(); } catch {}
+  }
+});
+
+app.setNotFoundHandler((req, reply) =>
+  req.raw.method==="GET" && req.headers.accept?.includes("text/html")
+    ? reply.sendFile("index.html")
+    : reply.code(404).send({ error: "Not Found" })
+);
+
+app.listen({ port }).then(()=>console.log(`Server running on ${port}`));

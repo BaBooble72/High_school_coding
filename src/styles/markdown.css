@@ -1,0 +1,12 @@
+.ai-md {
+  line-height: 1.5;
+}
+.ai-md p { margin: 0.25rem 0; }
+.ai-md strong { font-weight: 600; }
+.ai-md em { font-style: italic; }
+.ai-md a { text-decoration: underline; opacity: .95; }
+.ai-md code { background: rgba(148,163,184,.15); padding: 0 .25rem; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.ai-md pre { background: rgba(148,163,184,.12); padding: .5rem .75rem; border-radius: 8px; overflow: auto; white-space: pre; }
+.ai-md pre code { background: transparent; padding: 0; }
+.ai-md ul, .ai-md ol { padding-left: 1.25rem; margin: .25rem 0; }
+.ai-md blockquote { border-left: 2px solid rgba(148,163,184,.35); padding-left: .6rem; margin: .25rem 0; opacity: .9; }
